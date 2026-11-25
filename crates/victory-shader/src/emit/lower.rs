@@ -4012,6 +4012,9 @@ impl<'a> Lower<'a> {
                 } else {
                     (11 | u, 0)
                 };
+                // Structured views are raw on the host (`buffer`): their
+                // size in bytes, divided by the stride below.
+                let props = if props.0 & 0xFF == 12 { (11 | u, props.1) } else { props };
                 if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
                     return Err("a constant buffer's descriptor read as data");
                 }
@@ -4025,15 +4028,21 @@ impl<'a> Lower<'a> {
                 if used.kind == ResourceType::Cbv {
                     return Err("a constant buffer's descriptor read as data");
                 }
+                // Structured views are raw on the host (`buffer`): their
+                // size in bytes, divided by the stride below.
                 let props = match used.stride {
                     0 | 1 => (11 | u, 0),
-                    s if s.is_multiple_of(4) => (12 | u, s),
+                    s if s.is_multiple_of(4) => (11 | u, s),
                     _ => return Err("a scalar-loaded buffer of odd stride read as data"),
                 };
                 (props, None)
             }
             _ => return Err("a scalar memory read as data"),
         };
+        // A raw view's props carry the stride its records count in (the
+        // structured view the console's descriptor is), 0 for bytes.
+        let records = if props.0 & 0xFF == 11 { props.1 } else { 0 };
+        let props = if props.0 & 0xFF == 11 { (props.0, 0) } else { props };
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
         let i32t = self.s.t.i32;
@@ -4083,6 +4092,11 @@ impl<'a> Lower<'a> {
                 let last = self.s.m.bin(c, Bin::Shl, levels, k16);
                 let d3 = self.s.m.bin(c, Bin::Or, base, last);
                 vec![(1, d1), (2, d2), (3, d3), (4, depth)]
+            }
+            None if records > 0 => {
+                let bytes = field(self, 0);
+                let stride = self.s.m.i32(records);
+                vec![(2, self.s.m.bin(c, Bin::UDiv, bytes, stride))]
             }
             None => vec![(2, field(self, 0))],
         };
@@ -4832,7 +4846,7 @@ impl<'a> Lower<'a> {
             return index;
         }
         let c = self.cur;
-        let last = self.s.m.i32(super::HEAP_VIEWS - 1);
+        let last = self.s.m.i32(super::heap_views() - 1);
         let over = self.s.m.cmp(c, pred::IUGT, index, last);
         let index = self.s.m.select(c, over, last, index);
         let four = self.s.m.i32(4);
@@ -4845,7 +4859,7 @@ impl<'a> Lower<'a> {
         let zero = self.s.m.i32(0);
         let none = self.s.m.cmp(c, pred::EQ, stride, zero);
         // The null unordered access view sits just below the null SRV.
-        let null = super::NULL_BUFFER_VIEW - u32::from(props.0 & 0x1000 != 0);
+        let null = super::null_buffer_view() - u32::from(props.0 & 0x1000 != 0);
         let null = self.s.m.i32(null);
         self.s.m.select(c, none, null, index)
     }
@@ -8450,12 +8464,22 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        // A heap-indexed buffer read by element has no used-resource entry,
-        // so no stride: its bytes are addressed as the hardware does, the
-        // element times the view's stride (the host's table) plus the offset.
+        // A buffer read by element is addressed as the hardware does, the
+        // element times the stride plus the offset, through a raw view: the
+        // host makes every structured view raw (`victory-gpu`'s descriptor
+        // heap), since hosts differ in how a structured view reads through
+        // a raw handle (NVIDIA scales the offset) and the reverse. A
+        // heap-indexed buffer has no used-resource entry, so no stride: the
+        // view's (the host's table).
         let index = match index {
             Some(i) if used.is_none() && !typed => {
                 let stride = self.view_stride(src)?;
+                let rows = self.s.m.bin(c, Bin::Mul, i, stride);
+                off = self.s.m.bin(c, Bin::Add, rows, off);
+                None
+            }
+            Some(i) if !typed && used.is_some_and(|u| u.stride >= 4 && u.stride.is_multiple_of(4)) => {
+                let stride = self.s.m.i32(used.map_or(0, |u| u.stride));
                 let rows = self.s.m.bin(c, Bin::Mul, i, stride);
                 off = self.s.m.bin(c, Bin::Add, rows, off);
                 None

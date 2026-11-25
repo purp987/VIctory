@@ -62,6 +62,36 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+/// [`super::heap_views`]: the largest shader-visible view heap the default
+/// adapter takes, of the two sizes translated shaders can be made for.
+/// Without a device, [`super::HEAP_VIEWS`] (nothing runs them here).
+pub(super) fn default_view_heap() -> u32 {
+    let mut device: Option<ID3D12Device> = None;
+    // SAFETY: plain device creation with a valid out pointer.
+    match unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device) } {
+        Ok(()) => device.map_or(super::HEAP_VIEWS, |d| largest_view_heap(&d)),
+        Err(_) => super::HEAP_VIEWS,
+    }
+}
+
+/// The largest shader-visible view heap `device` takes, of the two sizes
+/// translated shaders can be made for: [`super::HEAP_VIEWS`], else
+/// [`super::PORTABLE_HEAP_VIEWS`] (which every device takes).
+pub fn largest_view_heap(device: &ID3D12Device) -> u32 {
+    // SAFETY: plain heap creation; the heap is dropped at once.
+    let takes = |n: u32| unsafe {
+        device
+            .CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: n,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            })
+            .is_ok()
+    };
+    if takes(super::HEAP_VIEWS) { super::HEAP_VIEWS } else { super::PORTABLE_HEAP_VIEWS }
+}
+
 impl Host {
     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
@@ -1201,8 +1231,8 @@ pub enum View<'a> {
     NullPair,
     /// The second slot of a [`View::Memory`] or [`View::NullPair`].
     Pair,
-    /// Last in the heap, which then has [`super::HEAP_VIEWS`] slots: the
-    /// host's null raw buffer SRV at [`super::NULL_BUFFER_VIEW`] and UAV
+    /// Last in the heap, which then has [`super::heap_views`] slots: the
+    /// host's null raw buffer SRV at [`super::null_buffer_view`] and UAV
     /// below it.
     NullBuffers,
 }
@@ -1353,7 +1383,7 @@ impl Host {
                 Ok(b)
             };
             let slots = match d.views.last() {
-                Some(View::NullBuffers) => super::HEAP_VIEWS as usize,
+                Some(View::NullBuffers) => super::heap_views() as usize,
                 _ => d.views.len(),
             };
             let views = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, slots)?;
@@ -1592,6 +1622,14 @@ impl Host {
                                 0,
                                 D3D12_BUFFER_SRV_FLAG_NONE,
                             ),
+                            // Raw, as `victory-gpu` makes structured views
+                            // (translated shaders read them as raw).
+                            Stride::Structured(s) if s.is_multiple_of(4) => (
+                                DXGI_FORMAT_R32_TYPELESS,
+                                data.len(),
+                                0,
+                                D3D12_BUFFER_SRV_FLAG_RAW,
+                            ),
                             Stride::Structured(s) => (
                                 DXGI_FORMAT_UNKNOWN,
                                 data.len() * 4 / s as usize,
@@ -1683,7 +1721,7 @@ impl Host {
                     }
                     View::Pair => {}
                     View::NullBuffers => {
-                        let null = super::NULL_BUFFER_VIEW as usize;
+                        let null = super::null_buffer_view() as usize;
                         let (mut srv_at, mut uav_at) = (at, at);
                         srv_at.ptr += (null - i) * view_size;
                         uav_at.ptr += (null - 1 - i) * view_size;
