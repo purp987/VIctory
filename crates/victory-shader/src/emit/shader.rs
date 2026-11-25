@@ -19,16 +19,45 @@ pub const VIEW_STRIDES: u8 = 255;
 /// Where the title-memory page table is bound: `t0` (a raw root SRV) in
 /// this space (see `emit` "Title memory").
 pub const MEMORY_SPACE: u32 = 2;
-/// Heap indices are clamped below these (views, samplers): the host's heaps
-/// are at least this large, the slots past their own null (`emit`, "Heap
-/// indices").
+/// The most view-heap slots translated shaders index: heap indices are
+/// clamped below [`heap_views`], which is this where the host takes a heap
+/// this large (`emit`, "Heap indices").
 pub const HEAP_VIEWS: u32 = 1 << 21;
+/// The view-heap size every D3D12 device takes (binding tiers 1 and 2 cap
+/// shader-visible heaps here, tier 3 may take more; NVIDIA's tier 3 does
+/// not): [`heap_views`] on hosts that refuse [`HEAP_VIEWS`].
+pub const PORTABLE_HEAP_VIEWS: u32 = 1_000_000;
+/// Sampler-heap indices are clamped below this: the host's sampler heaps
+/// are at least this large, the slots past their own null.
 pub const HEAP_SAMPLERS: u32 = 2048;
+
+/// View-heap indices are clamped below this: the host's view heaps are at
+/// least this large, the slots past their own null. [`HEAP_VIEWS`] where
+/// the default adapter takes a heap that large (asked once, on first use),
+/// else [`PORTABLE_HEAP_VIEWS`]; [`HEAP_VIEWS`] in builds without the host.
+/// Part of the translation: a shader cache must key on it.
+pub fn heap_views() -> u32 {
+    static VIEWS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *VIEWS.get_or_init(|| {
+        #[cfg(all(windows, any(test, feature = "host")))]
+        {
+            super::host::default_view_heap()
+        }
+        #[cfg(not(all(windows, any(test, feature = "host"))))]
+        {
+            HEAP_VIEWS
+        }
+    })
+}
+
 /// The heap index of the host's null raw buffer view (the null raw
 /// unordered access view at the index below), read instead of a slot that
 /// holds no buffer view where a shader reads one at an index it computes
-/// (`emit`, "Buffer views at computed heap indices").
-pub const NULL_BUFFER_VIEW: u32 = HEAP_VIEWS - 2;
+/// (`emit`, "Buffer views at computed heap indices"): the last slot but one
+/// below [`heap_views`].
+pub fn null_buffer_view() -> u32 {
+    heap_views() - 2
+}
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -456,7 +485,7 @@ impl Shader {
         self.nonuniform_handles += u32::from(nonuniform);
         // An index past the host's heap faults the device (a console shader
         // reads whatever memory follows its heap): the last slot instead.
-        let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { HEAP_VIEWS } - 1);
+        let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { heap_views() } - 1);
         let over = self.m.cmp(block, pred::IUGT, index, last);
         let index = self.m.select(block, over, last, index);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));

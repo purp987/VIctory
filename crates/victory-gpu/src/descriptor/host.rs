@@ -113,16 +113,16 @@ impl HostHeap {
         };
         // Every slot a shader can index (title slots, also past a capped
         // heap, and dynamic ones): shaders read the table as a root view,
-        // which has no bounds, at indices clamped below `HEAP_VIEWS`.
+        // which has no bounds, at indices clamped below `heap_views()`.
         let strides = (!sampler)
-            .then(|| host.upload_buffer(u64::from(count.max(victory_shader::emit::HEAP_VIEWS)) * 4))
+            .then(|| host.upload_buffer(u64::from(count.max(victory_shader::emit::heap_views())) * 4))
             .flatten()
             .map(|(buffer, data)| (buffer, data as usize));
         // The larger dynamic range only where the host takes it on top of
         // every title slot; else the smaller one, and the cap after that.
-        // Translated shaders clamp their indices below `HEAP_VIEWS` or
+        // Translated shaders clamp their indices below `heap_views()` or
         // `HEAP_SAMPLERS`: slots up to there exist and stay null.
-        let (views, samplers) = (victory_shader::emit::HEAP_VIEWS, victory_shader::emit::HEAP_SAMPLERS);
+        let (views, samplers) = (victory_shader::emit::heap_views(), victory_shader::emit::HEAP_SAMPLERS);
         let (heap, count, extra) = if sampler {
             match make(count.max(samplers)) {
                 Ok(heap) => (heap, count, 0),
@@ -134,7 +134,7 @@ impl HostHeap {
         } else if let Ok(heap) = make((count + DYNAMIC).max(views)) {
             (heap, count, DYNAMIC)
         } else {
-            // shortcut: a host that caps its heaps below `HEAP_VIEWS` (NVIDIA)
+            // shortcut: a host that caps its heaps below `heap_views()`
             // faults on an index past them, as before the clamp.
             match make(count + MIN_DYNAMIC) {
                 Ok(heap) => (heap, count, MIN_DYNAMIC),
@@ -179,7 +179,7 @@ impl HostHeap {
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
             pairs: Mutex::new((count + extra, Vec::new())),
-            pairs_end: match victory_shader::emit::NULL_BUFFER_VIEW {
+            pairs_end: match victory_shader::emit::null_buffer_view() {
                 null if !sampler && null > count + extra && null < total => null - 1,
                 _ => total,
             },
@@ -202,7 +202,7 @@ impl HostHeap {
         // What shaders read instead of a slot without a buffer view where
         // they take one at a computed index (`victory_shader::emit`, "Buffer
         // views at computed heap indices"): a null raw SRV, and UAV below it.
-        let null = victory_shader::emit::NULL_BUFFER_VIEW;
+        let null = victory_shader::emit::null_buffer_view();
         if !sampler && null > count + extra && null < total {
             h.raw_view_at(null, None, 0, 0, false);
             h.raw_view_at(null - 1, None, 0, 0, true);
@@ -450,11 +450,11 @@ impl HostHeap {
 
     fn write_stride(&self, index: u32, stride: u32) {
         let Some((_, data)) = &self.strides else { return };
-        if index >= self.count.max(victory_shader::emit::HEAP_VIEWS) {
+        if index >= self.count.max(victory_shader::emit::heap_views()) {
             return;
         }
         // SAFETY: a dword of the mapped table, which has one per slot below
-        // the larger of the title's count and `HEAP_VIEWS`.
+        // the larger of the title's count and `heap_views()`.
         unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride) };
     }
 
@@ -841,20 +841,24 @@ fn buffer_srv(
         once!(len, "buffer view of elements without a size");
         return None;
     }
-    // The copy its own bytes are in, its first element counted from there.
+    let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0
+        || buffer.StructureByteStride > 0 && buffer.StructureByteStride.is_multiple_of(4);
+    // The copy its own bytes are in, its first element counted from there
+    // ([`view_align`]).
     let start = address + buffer.FirstElement * element;
-    let Some((shadow, own)) =
-        crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)
-    else {
+    let bytes = u64::from(buffer.NumElements) * element;
+    let Some((shadow, own)) = crate::shadow::for_view(start, bytes, view_align(raw, element)) else {
         #[cfg(feature = "diagnostics")]
         if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
             tracing::info!(start = format_args!("{start:#x}"), len, element, count = buffer.NumElements, "refused buffer view: no host copy");
         }
         return None;
     };
-    buffer.FirstElement = shadow.offset(start) / element;
-    let (first, count) = (buffer.FirstElement, buffer.NumElements);
-    if !in_buffer(&shadow.buffer, first, count, element) {
+    let (first, count, unit) = match raw {
+        true => raw_range(shadow.offset(start), bytes),
+        false => (shadow.offset(start) / element, buffer.NumElements, element),
+    };
+    if !in_buffer(&shadow.buffer, first, count, unit) {
         #[cfg(feature = "diagnostics")]
         if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
             tracing::info!(start = format_args!("{start:#x}"), first, count, element, "refused buffer view: empty or past its copy");
@@ -863,12 +867,41 @@ fn buffer_srv(
         return None;
     }
     let host = host()?;
+    buffer.FirstElement = first;
+    if raw {
+        // Raw, as shaders read it ([`view_align`]).
+        desc.Format = DXGI_FORMAT_R32_TYPELESS;
+        buffer.NumElements = count;
+        buffer.StructureByteStride = 0;
+        buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+    }
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
         host.device
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
     Some(Some((shadow.buffer.clone(), own.then_some(shadow))))
+}
+
+/// The alignment of a view's first byte in the host copy it views: a raw
+/// view's start must be a multiple of 16 bytes (the host removes the
+/// device for one that is not, NVIDIA's at once), any other view's of its
+/// element. A view whose start in its buffer's copy is not gets a copy of
+/// its own bytes ([`crate::shadow::for_view`]).
+///
+/// Structured views (of whole dwords) are made raw: translated shaders read
+/// every structured buffer as raw, at the element times the stride plus
+/// the offset, as the console's hardware addresses it (`victory_shader::
+/// emit`, buffer reads by element), and a host need not read a structured
+/// view through a raw handle as raw (NVIDIA scales the offset by 4).
+fn view_align(raw: bool, element: u64) -> u64 {
+    if raw { 16 } else { element }
+}
+
+/// A raw view's first dword, dword count (at most 2^27, a buffer view's
+/// limit: 512 MiB) and unit (4 bytes) for `bytes` from byte `offset`.
+fn raw_range(offset: u64, bytes: u64) -> (u64, u32, u64) {
+    (offset / 4, (bytes / 4).min(1 << 27) as u32, 4)
 }
 
 /// Whether `count` elements of `element` bytes from element `first` lie in
@@ -907,22 +940,35 @@ fn buffer_uav(
         once!(len, "unordered buffer view of elements without a size");
         return None;
     }
+    let raw = buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0
+        || buffer.StructureByteStride > 0 && buffer.StructureByteStride.is_multiple_of(4);
     let start = address + buffer.FirstElement * element;
-    let (shadow, own) = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)?;
+    let bytes = u64::from(buffer.NumElements) * element;
+    let (shadow, own) = crate::shadow::for_view(start, bytes, view_align(raw, element))?;
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
         once!("unordered access to a buffer whose host copy shaders cannot write");
         return None;
     }
-    buffer.FirstElement = shadow.offset(start) / element;
+    let (first, count, unit) = match raw {
+        true => raw_range(shadow.offset(start), bytes),
+        false => (shadow.offset(start) / element, buffer.NumElements, element),
+    };
     buffer.CounterOffsetInBytes = 0;
-    let (first, count) = (buffer.FirstElement, buffer.NumElements);
-    if !in_buffer(&shadow.buffer, first, count, element) {
+    if !in_buffer(&shadow.buffer, first, count, unit) {
         once!(first, count, element, "unordered buffer view empty or past its host copy");
         return None;
     }
     let host = host()?;
+    buffer.FirstElement = first;
+    if raw {
+        // Raw, as shaders read it ([`view_align`]).
+        desc.Format = DXGI_FORMAT_R32_TYPELESS;
+        buffer.NumElements = count;
+        buffer.StructureByteStride = 0;
+        buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+    }
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
         host.device
@@ -1412,10 +1458,10 @@ mod tests {
             return; // no host GPU
         };
         // Every index a translated shader can reach exists (clamped below
-        // `HEAP_VIEWS`, `HEAP_SAMPLERS`).
+        // `heap_views()`, `HEAP_SAMPLERS`).
         // SAFETY: plain queries of live heaps.
         unsafe {
-            assert!(heap.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_VIEWS);
+            assert!(heap.heap.GetDesc().NumDescriptors >= victory_shader::emit::heap_views());
             let samplers = HostHeap::new(true, 128).unwrap();
             assert!(samplers.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_SAMPLERS);
         }
